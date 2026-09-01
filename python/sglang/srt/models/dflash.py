@@ -40,7 +40,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_bool_env_var, is_npu
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -48,6 +48,7 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+_kproj_pad_logged = False
 
 try:
     from flashinfer import top_k as _flashinfer_top_k
@@ -388,6 +389,25 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = nn.Linear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
+        # SM120 (consumer Blackwell) cuBLAS picks a no-split-K wmma kernel for this shape
+        # (N=2*taps*groups, K=hidden) whenever 5 <= M <= 16: 27.7 us vs 11.3 us at M=17..32,
+        # and the block-size-8 draft runs at exactly M=8. Padding the rows to 24 is
+        # static-shape (CUDA-graph safe) and costs a ~1 us copy. Measured 2026-09-01 on the
+        # dual 5090 rig: -0.1..-0.2 ms per verify step (~1%), below the acceptance noise of
+        # fixed-prompt benches, so it is OPT-IN: SGLANG_DFLASH_KPROJ_PAD=1 enables it.
+        self._kproj_pad_rows = 0
+        if (
+            get_bool_env_var("SGLANG_DFLASH_KPROJ_PAD", "False")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 12
+        ):
+            self._kproj_pad_rows = 24
+        global _kproj_pad_logged
+        if not _kproj_pad_logged:
+            _kproj_pad_logged = True
+            logger.info(
+                "[DFLASH] kernel_projection pad_rows(5<=M<=16)=%s", self._kproj_pad_rows
+            )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
         # Marked here, not inside: by the time the compiled function traces, the dim
@@ -406,7 +426,13 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        m = hidden_states.shape[0]
+        if self._kproj_pad_rows and hidden_states.dim() == 2 and 5 <= m <= 16:
+            padded = F.pad(hidden_states, (0, 0, 0, self._kproj_pad_rows - m))
+            coefficients = self.kernel_projection(padded)[:m]
+        else:
+            coefficients = self.kernel_projection(hidden_states)
+        coefficients = coefficients.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
