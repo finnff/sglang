@@ -14,8 +14,12 @@ reloaded KV would differ.
 
 The reference is the SAME pool with HiCache off -- not the static pool. Unified
 and static legitimately differ in reduction order here (measured up to 1.8 in
-logprob on a fresh prompt for this model), so a static baseline would drown the
-signal; against unified-without-HiCache the expectation is bit-equality.
+logprob on a fresh prompt for the GDN model), so a static baseline would drown
+the signal; against unified-without-HiCache the expectation is bit-equality.
+
+Both full-attention families get a cell: MHA reaches the L2 kernels through
+`data_ptrs` the unified subclass has to build itself, MLA through ones the base
+builds in `__init__`.
 
     python -m pytest test/registered/hicache/test_hicache_unified_memory.py -v
 """
@@ -32,13 +36,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=1500, stage="extra-b", runner_config="2-gpu-large")
 
-# Smallest in-tree GDN hybrid: MHA full attention + gated-delta-net state, i.e.
-# both a per-layer-view sub-pool and an envelope-strided state sub-pool.
-MODEL = "Qwen/Qwen3.5-0.8B"
-
-_BASE_ARGS = [
+_COMMON_ARGS = [
     "--trust-remote-code",
     "--enable-unified-memory",
     "--linear-attn-backend",
@@ -47,14 +47,14 @@ _BASE_ARGS = [
     "triton",
     "--mem-fraction-static",
     "0.6",
-    # A small device pool is what makes the host tier reachable at all.
+    # A small device pool is what makes the host tier reachable at all: the
+    # dozen fillers below have to push the target off the device.
     "--max-total-tokens",
     "8192",
     "--max-mamba-cache-size",
     "64",
     "--enable-cache-report",
 ]
-_HICACHE_ARGS = _BASE_ARGS + ["--enable-hierarchical-cache", "--hicache-ratio", "4"]
 
 _PREFIX = (
     "The following is a detailed technical description of a distributed inference "
@@ -80,23 +80,31 @@ def _generate(base_url, text, max_new_tokens=32, logprobs=True):
     return data["text"], lp
 
 
-class TestUnifiedMemoryHiCache(CustomTestCase):
+class UnifiedMemoryHiCacheBase(CustomTestCase):
+    """Two servers on the same pool, one with HiCache and one without."""
+
+    model: str = ""
+    extra_args: list = []
+
     @classmethod
     def setUpClass(cls):
-        cls.model = MODEL
+        if cls is UnifiedMemoryHiCacheBase:
+            raise unittest.SkipTest("base class")
+        base_args = _COMMON_ARGS + cls.extra_args
         cls.hicache_url = "http://127.0.0.1:8157"
         cls.reference_url = "http://127.0.0.1:8158"
         cls.process_hicache = popen_launch_server(
             cls.model,
             cls.hicache_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=_HICACHE_ARGS,
+            other_args=base_args
+            + ["--enable-hierarchical-cache", "--hicache-ratio", "4"],
         )
         cls.process_reference = popen_launch_server(
             cls.model,
             cls.reference_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=_BASE_ARGS + ["--base-gpu-id", "1"],
+            other_args=base_args + ["--base-gpu-id", "1"],
         )
 
     @classmethod
@@ -144,6 +152,32 @@ class TestUnifiedMemoryHiCache(CustomTestCase):
         for url in (self.hicache_url, self.reference_url):
             resp = requests.get(f"{url}/health", timeout=30)
             self.assertEqual(resp.status_code, 200)
+
+
+class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
+    """MHA full attention + gated-delta-net state: a per-layer-view sub-pool
+    (kernel-facing ids) alongside an envelope-strided state sub-pool (physical
+    slots, staged through a contiguous buffer)."""
+
+    model = "Qwen/Qwen3.5-0.8B"
+
+
+class TestUnifiedMemoryHiCacheMLA(UnifiedMemoryHiCacheBase):
+    """MLA full attention + KDA state. The MLA sub-pool reaches HiCache through
+    the same translate, but builds its `data_ptrs` in `MLATokenToKVPool.
+    __init__` rather than in the `_create_buffers` the unified subclass
+    overrides -- so it is a genuinely different wiring path from the MHA cell
+    above, worth its own cell rather than an assumed equivalence."""
+
+    model = "yujiepan/kimi-linear-tiny-random"
+    extra_args = [
+        "--attention-backend",
+        "triton",
+        "--cuda-graph-backend-decode",
+        "disabled",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+    ]
 
 
 if __name__ == "__main__":

@@ -259,7 +259,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         # contiguous buffer; and the host-transfer move gate freezes compaction
         # for the lifetime of an operation.
         #
-        # Two shapes stay out, for reasons that are specific and separate.
+        # One shape stays out.
         model_config = model_config_of(server_args)
         assert not model_config.is_hybrid_swa, (
             "--enable-unified-memory with --enable-hierarchical-cache does not "
@@ -269,17 +269,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "live (+5 on gpt-oss-20b, stable across a whole run), which trips "
             "the idle memory-leak invariant and aborts the scheduler. Run "
             "without --enable-hierarchical-cache, or without "
-            "--enable-unified-memory."
-        )
-        assert not use_mla_backend(server_args), (
-            "--enable-unified-memory with --enable-hierarchical-cache has not "
-            "been validated on MLA models. The wiring looks complete -- "
-            "MLATokenToKVPool builds `data_ptrs` in __init__ (not in the "
-            "`_create_buffers` the unified subclass overrides), and "
-            "`_init_unified_mamba_pools` installs both the translate and the "
-            "token capacity on the full sub-pool -- so this gate is here for "
-            "want of a run, not a known defect. Hybrid-Mamba models on an MHA "
-            "full side (e.g. Qwen3.5, Qwen3-Next) are supported."
+            "--enable-unified-memory. Full-attention hybrids -- MHA (Qwen3.5, "
+            "Qwen3-Next) and MLA (Kimi-Linear) -- are supported."
         )
 
     assert cfg.dcp_size == 1, (
