@@ -67,7 +67,9 @@ class L2TransferEngine:
         a compaction. The window from here to completion is covered by the
         host-transfer move gate, which freezes the mover.
         """
-        translate = transfer.device_pool.host_transfer_translate
+        # getattr: not every device pool derives from `KVCache` (the mamba
+        # state pool does not), so the attribute may be absent entirely.
+        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
         if translate is None:
             return transfer.device_indices
         return translate(transfer.device_indices)
@@ -87,9 +89,7 @@ class L2TransferEngine:
                     self.io_backend,
                 )
             ack_finish.record()
-            self._record_stream(
-                transfers, self.device_to_host_stream, device_indices
-            )
+            self._record_stream(transfers, self.device_to_host_stream, device_indices)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     def submit_host_to_device(
@@ -100,9 +100,7 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        device_indices = {
-            id(t): self._resolve_device_indices(t) for t in transfers
-        }
+        device_indices = {id(t): self._resolve_device_indices(t) for t in transfers}
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None

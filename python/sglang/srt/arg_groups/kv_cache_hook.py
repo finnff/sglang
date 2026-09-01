@@ -252,27 +252,34 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "is handed, and under the unified pool those are VIRTUAL."
     )
     if cfg.enable_hierarchical_cache:
-        # The attention sub-pools are wired: `KVCache.host_transfer_translate`
-        # resolves the controller's virtual ids to kernel-facing ones just
-        # before each L2 kernel, and the host-transfer move gate freezes
-        # compaction for the lifetime of the operation.
+        # HiCache is wired for the unified pool: `host_transfer_translate`
+        # resolves the controller's virtual ids to whatever each pool's device
+        # buffers are indexed by, immediately before each L2 kernel;
+        # `MambaPoolHost` stages the envelope-strided state views through a
+        # contiguous buffer; and the host-transfer move gate freezes compaction
+        # for the lifetime of an operation.
         #
-        # The recurrent-state sub-pool is not. `MambaPoolHost` addresses a slot
-        # as `ptr + index * item_size` (via transfer_kv_per_layer_mla), which
-        # assumes contiguous per-slot storage; the unified conv/SSM views are
-        # ENVELOPE-STRIDED, so every layer past the first would read the wrong
-        # bytes -- silently, since the addresses stay in range. Stride-aware
-        # host transfer is the follow-up that lifts this.
-        from sglang.srt.configs.hybrid_arch import mambaish_config
-
-        assert mambaish_config(model_config_of(server_args)) is None, (
+        # Two shapes stay out, for reasons that are specific and separate.
+        model_config = model_config_of(server_args)
+        assert not model_config.is_hybrid_swa, (
             "--enable-unified-memory with --enable-hierarchical-cache does not "
-            "support models with recurrent (Mamba / GDN / KDA / ShortConv) "
-            "state yet: the host pool addresses state slots as a contiguous "
-            "array, while the unified pool stores them envelope-strided. "
-            "Hybrid sliding-window and full-attention models (e.g. gpt-oss) "
-            "are supported."
+            "support hybrid sliding-window models yet. Generation is correct, "
+            "but under HiCache traffic the SWA component reports a small "
+            "constant excess of evictable tokens over what the allocator has "
+            "live (+5 on gpt-oss-20b, stable across a whole run), which trips "
+            "the idle memory-leak invariant and aborts the scheduler. Run "
+            "without --enable-hierarchical-cache, or without "
+            "--enable-unified-memory."
         )
+        assert not use_mla_backend(server_args), (
+            "--enable-unified-memory with --enable-hierarchical-cache does not "
+            "support MLA models yet: `UnifiedMLATokenToKVPool._create_buffers` "
+            "does not build the `data_ptrs` / `data_strides` the L2 kernels "
+            "address its per-layer views through, and the pairing is "
+            "unvalidated. Hybrid-Mamba models on an MHA full side (e.g. "
+            "Qwen3.5, Qwen3-Next) are supported."
+        )
+
     assert cfg.dcp_size == 1, (
         "--enable-unified-memory is not yet compatible with decode context "
         "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "

@@ -1342,6 +1342,11 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+    # Size any HiCache host pool against the STATIC token cap, not the
+    # sub-pool's `size` (a kernel-facing row count) nor the composite's `size`
+    # (the dynamic whole-buffer view, which would ask for a host pool covering
+    # the entire buffer instead of the configured limit).
+    token_to_kv_pool.full_kv_pool.host_capacity_tokens = max_total_num_tokens
 
     # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
     mamba_slot_allocator = UnifiedMambaSlotAllocator(
@@ -1349,9 +1354,15 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
+    # `_mamba_translate` feeds the retraction CPU-copy path.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
+    # HiCache addresses the state pool by PHYSICAL slot (it is a pure physical
+    # store), while the controller holds virtual slot ids; `L2TransferEngine`
+    # applies this just before each transfer.
+    req_to_token_pool.mamba_pool.host_transfer_translate = (
+        mamba_slot_allocator.translate
+    )
     # No full-KV translate hook is wired: both MLA doors now receive
     # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
     # translated at their production sites.
