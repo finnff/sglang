@@ -22,6 +22,13 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
+    # Derive this pool's device rows from the ANCHOR's, instead of allocating
+    # them. Set when the two pools do not have independent id spaces: under the
+    # unified memory pool a virtual id names both a full-attention page and a
+    # sliding-window page, and the composite allocator binds both at once, so
+    # the SWA side has nothing left to allocate -- calling its sub-allocator
+    # directly trips `assert is_id_owner`.
+    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 

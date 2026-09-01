@@ -197,6 +197,7 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
+    device_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> PoolEntry:
     return PoolEntry(
@@ -209,6 +210,7 @@ def build_pool_entry(
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
+        device_indices_from_anchor_fn=device_indices_from_anchor_fn,
         packed_draft_device_pools=packed_draft_device_pools,
     )
 
@@ -268,6 +270,7 @@ def build_hybrid_swa_group(
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     swa_attn_allocator: Any = None,
+    swa_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     mtp_swa_device_pools: tuple[Any, ...] = (),
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
@@ -312,12 +315,28 @@ def build_hybrid_swa_group(
                 transfer_layer_num=transfer_layer_num + len(mtp_swa_device_pools),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
+                # Under the unified pool the SWA rows are bound by the SAME
+                # composite allocation as the full ones, so they are derived
+                # rather than allocated (and there is nothing separate to free).
                 device_alloc_fn=(
-                    swa_attn_allocator.alloc if swa_attn_allocator is not None else None
+                    None
+                    if swa_indices_from_anchor_fn is not None
+                    else (
+                        swa_attn_allocator.alloc
+                        if swa_attn_allocator is not None
+                        else None
+                    )
                 ),
                 device_free_fn=(
-                    swa_attn_allocator.free if swa_attn_allocator is not None else None
+                    (lambda _indices: None)
+                    if swa_indices_from_anchor_fn is not None
+                    else (
+                        swa_attn_allocator.free
+                        if swa_attn_allocator is not None
+                        else None
+                    )
                 ),
+                device_indices_from_anchor_fn=swa_indices_from_anchor_fn,
                 packed_draft_device_pools=mtp_swa_device_pools,
             ),
         ]
@@ -411,6 +430,17 @@ def build_hybrid_swa_stack(
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
         swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
+        # ...unless full and SWA share one virtual id space (unified memory),
+        # in which case the composite already bound the SWA page and the rows
+        # follow from the anchor's. `translate_loc_from_full_to_swa` on that
+        # allocator maps virtual -> swa KERNEL-FACING, which is what the L2
+        # kernels index, and matches how `UnifiedRadixCache` derives the same
+        # component on the backup side.
+        swa_indices_from_anchor_fn=(
+            params.token_to_kv_pool_allocator.translate_loc_from_full_to_swa
+            if get_memory().enable_unified_memory
+            else None
+        ),
         mtp_swa_device_pools=mtp_swa_device_pools,
     )
     cache_controller = HybridCacheController(

@@ -853,6 +853,19 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
                 continue
+            if entry.device_indices_from_anchor_fn is not None:
+                # This pool has no id space of its own: its rows were bound by
+                # the SAME allocation that produced the anchor's (the unified
+                # memory pool's full/SWA pair). Deriving is not an optimisation
+                # here -- allocating would trip the sub-allocator's
+                # `assert is_id_owner`.
+                if kv_device_indices is None:
+                    rollback_allocated()
+                    return None
+                pool.device_indices = entry.device_indices_from_anchor_fn(
+                    kv_device_indices
+                )
+                continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
             # rather than an allocator (e.g. SWA).
