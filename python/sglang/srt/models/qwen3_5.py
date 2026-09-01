@@ -154,7 +154,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
-_gdn_use_alt_stream = _is_cuda or (
+# 2026-09-01 (dual RTX 5090 / SM120, TP=2): cuBLAS picks a no-split-K WMMA kernel for the
+# bf16 in_proj_ba GEMM (N=48 per rank, K=5120) whenever 2 <= M <= 8 -- 29 us instead of the
+# 7 us it takes at M >= 9 (scratchpad/ba_msweep.py). DFlash verify at BS=1 is exactly M=8,
+# and since ba runs on the alt stream, starved by the fp8 qkvz GEMM on the main stream, the
+# main stream then waits ~50 us per GDN layer (~1 ms per decode step). Padding M to 16 rows
+# sidesteps the heuristic (static shape, so CUDA-graph safe). SGLANG_GDN_BA_PAD=0 disables
+# it; SGLANG_GDN_BA_SERIAL=1 keeps ba on the main stream (measured worse: the overlap helps).
+_gdn_ba_serial = get_bool_env_var("SGLANG_GDN_BA_SERIAL")
+_gdn_ba_pad = get_bool_env_var("SGLANG_GDN_BA_PAD", "True") and _is_cuda
+_gdn_use_alt_stream = (_is_cuda and not _gdn_ba_serial) or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _qknorm_use_alt_stream = _is_cuda or (
@@ -323,6 +332,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.alt_stream = alt_stream
+        # Only SM120 (consumer Blackwell) was measured to have the cuBLAS M<=8 cliff.
+        self._ba_pad_rows = (
+            16 if _gdn_ba_pad and torch.cuda.get_device_capability()[0] == 12 else 0
+        )
+        if layer_id == 0:
+            logger.info(
+                "[GDN] in_proj_ba: alt_stream=%s pad_rows(2<=M<=8)=%s",
+                _gdn_use_alt_stream,
+                self._ba_pad_rows,
+            )
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
@@ -749,6 +768,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
+    def _ba_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        m = hidden_states.shape[0]
+        if self._ba_pad_rows and 2 <= m <= 8:
+            padded = torch.nn.functional.pad(hidden_states, (0, 0, 0, self._ba_pad_rows - m))
+            return self.in_proj_ba(padded)[0][:m]
+        return self.in_proj_ba(hidden_states)[0]
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
@@ -831,7 +857,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = self._ba_proj(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -844,7 +870,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._ba_proj(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
