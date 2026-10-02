@@ -669,6 +669,30 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        # A write-through chain locks every node until its ack lands; a long chunked
+        # prompt's chain can pin the whole Mamba pool, so drain the acks and evict again.
+        if (
+            mamba_target is not None
+            and self.cache_controller is not None
+            and self.ongoing_write_through
+            and self._component_available_size(ComponentType.MAMBA) < mamba_target[1]
+        ):
+            num_pending = len(self.ongoing_write_through)
+            self.writing_check(write_back=True)
+            mamba_evictable = self.mamba_evictable_size()
+            logger.info(
+                f"Mamba alloc drained {num_pending} write-through acks, "
+                f"{mamba_evictable} mamba slots now evictable"
+            )
+            if mamba_evictable > 0:
+                drain_result = self._evict(
+                    EvictParams(mamba_num=mamba_evictable),
+                    {ComponentType.MAMBA: mamba_target},
+                )
+                result.num_tokens_evicted += drain_result.num_tokens_evicted
+                result.swa_num_tokens_evicted += drain_result.swa_num_tokens_evicted
+                result.mamba_num_evicted += drain_result.mamba_num_evicted
+
         return result
 
     @staticmethod
