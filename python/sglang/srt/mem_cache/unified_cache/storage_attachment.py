@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -73,6 +74,12 @@ class StorageAttachment:
                 False,
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
+            )
+        if isinstance(cache.token_to_kv_pool_allocator, DraftSWATokenToKVPoolAllocator):
+            return (
+                False,
+                "--speculative-draft-kv-ratio below 1 does not support "
+                "--hicache-storage-backend.",
             )
 
         # Write-back can retain auxiliary host rows without FULL, or backed
