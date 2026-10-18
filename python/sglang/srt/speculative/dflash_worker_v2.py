@@ -1805,19 +1805,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.kv_index_translator)
 
-    def _draft_kv_write_loc(
-        self, cache_loc: torch.Tensor, *, mark_bare: bool = False
-    ):
-        """Add the draft-side loc for a bounded draft pool. A plain loc stays bare
-        for the 2-D prefix path; ``mark_bare`` marks it physical for set_kv_buffer."""
+    def _draft_swa_loc(self, cache_loc: torch.Tensor) -> Optional[torch.Tensor]:
+        """The draft-side loc for a bounded draft pool, None for a full one."""
         pool = self.draft_model_runner.token_to_kv_pool
         if not isinstance(pool, SWAKVPool):
-            return KVWriteLoc(cache_loc, physical=True) if mark_bare else cache_loc
-        return KVWriteLoc(
-            loc=cache_loc,
-            swa_loc=pool.translate_loc_from_full_to_swa(cache_loc),
-            physical=True,
-        )
+            return None
+        return pool.translate_loc_from_full_to_swa(cache_loc)
+
+    def _draft_kv_write_loc_2d(self, cache_loc_2d: torch.Tensor):
+        """The prefix-valid writer's loc: bare unless the draft pool is bounded."""
+        swa_loc_2d = self._draft_swa_loc(cache_loc_2d)
+        if swa_loc_2d is None:
+            return cache_loc_2d
+        return KVWriteLoc(cache_loc_2d, swa_loc=swa_loc_2d, physical=True)
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
@@ -1963,7 +1963,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                write_loc_2d = self._draft_kv_write_loc(cache_loc_2d)
+                write_loc_2d = self._draft_kv_write_loc_2d(cache_loc_2d)
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -2014,7 +2014,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        write_loc = self._draft_kv_write_loc(ctx_cache_loc, mark_bare=True)
+        write_loc = KVWriteLoc(
+            ctx_cache_loc, swa_loc=self._draft_swa_loc(ctx_cache_loc), physical=True
+        )
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -2052,11 +2054,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
-        write_loc = self._draft_kv_write_loc(ctx_cache_loc, mark_bare=True)
+        swa_loc = self._draft_swa_loc(ctx_cache_loc)
         write_loc_2d = (
             None
             if ctx_cache_loc_2d is None
-            else self._draft_kv_write_loc(ctx_cache_loc_2d)
+            else self._draft_kv_write_loc_2d(ctx_cache_loc_2d)
         )
 
         def _write_layer_kv(
@@ -2078,7 +2080,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    write_loc,
+                    KVWriteLoc(ctx_cache_loc, swa_loc=swa_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
